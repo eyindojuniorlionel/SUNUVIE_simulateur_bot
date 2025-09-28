@@ -45,7 +45,7 @@ logger = logging.getLogger(__name__)
     CAP_PRET,
     # SELECTION MEDICAL
     SEL_MED,
-) = range(18)
+) = range(16)
 
 # -------------------------
 # Charger les fichiers Excel (avec protections)
