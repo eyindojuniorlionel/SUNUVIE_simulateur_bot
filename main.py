@@ -283,7 +283,15 @@ async def saisie_nb_rente(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return NBRENTE
 
     context.user_data["nbRente"] = nb_rente
-    await update.message.reply_text("Entrez le montant (si Prestation définie => montant de la rente annuelle, sinon la cotisation mensuelle) :")
+
+    # 🔹 Texte personnalisé en fonction du type de prestation choisi
+    typCot = context.user_data.get("typCot")
+    if typCot == 1:
+        message = "Entrez le montant de la rente annuelle :"
+    else:
+        message = "Entrez la cotisation mensuelle :"
+
+    await update.message.reply_text(message)
     return MONTANT
 
 async def saisie_montant(update: Update, context: ContextTypes.DEFAULT_TYPE):
