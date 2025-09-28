@@ -1,4 +1,4 @@
-# bot.py
+# bot_completed_with_emprunteur.py
 import os
 import logging
 import pandas as pd
@@ -39,7 +39,13 @@ logger = logging.getLogger(__name__)
     FER_CHOIX,
     FER_DUREE,
     FER_MONTANT,
-) = range(12)
+    # EMPRUNTEUR states
+    DNAISS_E,
+    DUREE_PRET,
+    CAP_PRET,
+    # SELECTION MEDICAL
+    SEL_MED,
+) = range(18)
 
 # -------------------------
 # Charger les fichiers Excel (avec protections)
@@ -50,6 +56,8 @@ try:
     # FER+ sheets (doit exister)
     df_fer_grille = pd.read_excel("table_taux_FER+.xlsx", sheet_name="grille_FER+")
     df_fer_table = pd.read_excel("table_taux_FER+.xlsx", sheet_name="table_taux_FER+")
+    # EMPRUNTEUR rates
+    df_emp = pd.read_excel("/mnt/data/tauxEmp.xlsx", sheet_name="tauxEmp")
 except Exception as e:
     logger.exception("Erreur en lisant les fichiers Excel. Vérifie qu'ils sont présents et nommés correctement.")
     raise SystemExit(e)
@@ -92,7 +100,37 @@ df_fer_table["dureeCot"] = pd.to_numeric(df_fer_table["dureeCot"], errors="coerc
 df_fer_table["tauxP"] = pd.to_numeric(df_fer_table["tauxP"], errors="coerce")
 df_fer_table.set_index("dureeCot", inplace=True)
 
+# EMPRUNTEUR : normaliser le tableau des taux
+if "age" not in df_emp.columns:
+    # si la colonne s'appelle différemment, tente de trouver la première colonne non-numérique
+    raise SystemExit("Le fichier tauxEmp.xlsx doit contenir une colonne 'age'.")
+# convertir l'index age
+df_emp = df_emp.copy()
+df_emp["age"] = df_emp["age"].astype(int)
+# Les colonnes restantes représentent la durée (en mois probablement). On les convertit en int.
+cols = [c for c in df_emp.columns if c != "age"]
+# certaines colonnes sont des nombres d'entiers (1..360)
+new_cols = {}
+for c in cols:
+    try:
+        new_c = int(c)
+        new_cols[c] = new_c
+    except Exception:
+        # tenter convertir en float puis int
+        try:
+            new_cols[c] = int(float(c))
+        except Exception:
+            # ignorer colonne
+            logger.warning("Colonne non reconnue dans tauxEmp: %s", c)
+            new_cols[c] = c
+# Renommer les colonnes
+df_emp.rename(columns=new_cols, inplace=True)
+# indexer par age
+df_emp.set_index("age", inplace=True)
+
+# -------------------------
 # Mapping capital obsèques (choix 1..5 -> montant)
+# -------------------------
 CAP_OBSEQUES = {
     "1": 1000000,
     "2": 2000000,
@@ -108,9 +146,11 @@ def available_ages_taux():
     ages = sorted({int(idx.split("-")[0]) for idx in df_taux.index})
     return min(ages), max(ages)
 
+
 def available_ages_prime():
     ages = sorted({int(idx.split("-")[0]) for idx in df_prime.index})
     return min(ages), max(ages)
+
 
 def get_taux(age: int, nb_rente: int, duree: int):
     key = f"{age}-{nb_rente}"
@@ -122,6 +162,7 @@ def get_taux(age: int, nb_rente: int, duree: int):
     except Exception:
         logger.exception("Erreur get_taux")
         return None
+
 
 def get_prime(age: int, per_cot: str, cap_obsq: int):
     key = f"{age}-{per_cot}"
@@ -141,6 +182,7 @@ def get_fer_grille(choix: str):
         return None
     return df_fer_grille.loc[choix]
 
+
 def get_fer_taux(duree: int):
     if duree not in df_fer_table.index:
         return None
@@ -148,6 +190,23 @@ def get_fer_taux(duree: int):
         return float(df_fer_table.loc[duree, "tauxP"])
     except Exception:
         logger.exception("Erreur get_fer_taux")
+        return None
+
+# EMPRUNTEUR helper
+def get_emp_taux(age: int, duree_mois: int):
+    """Retourne le taux (float) pour l'age et la durée en mois.
+    Les colonnes du fichier tauxEmp.xlsx sont supposées être des entiers représentant des durées (1..360).
+    """
+    if age not in df_emp.index:
+        return None
+    # si la colonne n'existe pas, retourner None
+    if duree_mois not in df_emp.columns:
+        return None
+    try:
+        val = df_emp.loc[age, duree_mois]
+        return float(val) if pd.notna(val) else None
+    except Exception:
+        logger.exception("Erreur get_emp_taux")
         return None
 
 # -------------------------
@@ -158,8 +217,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"Bonjour {user.first_name or ''} !\n\n"
         "Vous souhaitez faire une cotation de :\n"
-        "1- Assur'Education\n2- IBEKELIA\n3- FER+\n4- Autre produit\n\n"
-        "Répondez par 1, 2, 3 ou 4."
+        "1- Assur'Education\n2- IBEKELIA\n3- FER+\n4- Autre produit\n5- Emprunteur\n6- Sélection Médical\n\n"
+        "Répondez par 1, 2, 3, 4, 5 ou 6."
     )
     return PRODUIT
 
@@ -193,6 +252,12 @@ async def choix_produit(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "H - Je peux cotiser plus de 120 000 par mois (saisie libre)"
         )
         return FER_CHOIX
+    elif choix == "5":
+        await update.message.reply_text("Parcours EMPRUNTEUR :\nEntrez votre année de naissance (AAAA) :")
+        return DNAISS_E
+    elif choix == "6":
+        await update.message.reply_text("Parcours SÉLECTION MÉDICAL :\nModule en cours de développement…")
+        return ConversationHandler.END
     else:
         # Autre produit / construction (conserve le comportement précédent)
         await update.message.reply_text("Parcours en construction…")
@@ -478,6 +543,75 @@ async def fer_montant(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     return ConversationHandler.END
 
+# ----- EMPRUNTEUR handlers (nouveau) -----
+async def saisie_ddnaiss_e(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    try:
+        ddNaiss = int(text)
+        if ddNaiss < 1900 or ddNaiss > datetime.datetime.now().year:
+            raise ValueError
+    except Exception:
+        await update.message.reply_text("Année invalide. Entrez l'année de naissance au format AAAA (ex: 1985).")
+        return DNAISS_E
+
+    age = datetime.datetime.now().year - ddNaiss
+    # vérifier que l'âge existe dans la grille emprunteur
+    if age not in df_emp.index:
+        await update.message.reply_text(
+            f"Âge hors grille pour Emprunteur (âge calculé = {age}).\n"
+            "Veuillez contacter un conseiller ou recommencer avec /start."
+        )
+        return ConversationHandler.END
+
+    context.user_data["ddNaiss"] = ddNaiss
+    context.user_data["age"] = age
+    await update.message.reply_text("Entrez la durée mensuelle du prêt (en mois, ex: 12, 24, 360) :")
+    return DUREE_PRET
+
+async def saisie_duree_pret(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    try:
+        duree = int(text)
+    except Exception:
+        await update.message.reply_text("Durée invalide. Entrez un entier (durée en mois, ex: 12, 24, 360).")
+        return DUREE_PRET
+
+    age = context.user_data.get("age")
+    # vérifier que la colonne existe
+    if duree not in df_emp.columns:
+        await update.message.reply_text(
+            f"Aucun taux trouvé pour une durée de {duree} mois. Vérifiez la durée ou contactez un conseiller."
+        )
+        return ConversationHandler.END
+
+    context.user_data["dureePret"] = duree
+    await update.message.reply_text("Entrez le capital emprunté (ex: 5000000) :")
+    return CAP_PRET
+
+async def saisie_cap_pret(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip().replace(",", "")
+    try:
+        capPret = float(text)
+    except Exception:
+        await update.message.reply_text("Capital invalide. Entrez un nombre (ex : 5000000).")
+        return CAP_PRET
+
+    age = context.user_data.get("age")
+    duree = context.user_data.get("dureePret")
+
+    tauxPrime = get_emp_taux(age, duree)
+    if tauxPrime is None:
+        await update.message.reply_text("Désolé, aucun taux trouvé pour vos paramètres. Rendez-vous chez SUNU pour la prise en charge de votre requête.")
+        return ConversationHandler.END
+
+    prime = tauxPrime * capPret
+    if prime == 0:
+        await update.message.reply_text("Rendez-vous chez SUNU pour la prise en charge de votre requête.")
+    else:
+        await update.message.reply_text(f"✅ La prime unique est de : {prime:,.2f} Fcfa.")
+
+    return ConversationHandler.END
+
 # ----- Cancel -----
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Opération annulée. Tapez /start pour recommencer.")
@@ -511,6 +645,10 @@ def main():
             FER_CHOIX: [MessageHandler(filters.TEXT & ~filters.COMMAND, fer_choix)],
             FER_DUREE: [MessageHandler(filters.TEXT & ~filters.COMMAND, fer_duree)],
             FER_MONTANT: [MessageHandler(filters.TEXT & ~filters.COMMAND, fer_montant)],
+            # EMPRUNTEUR states (nouveau)
+            DNAISS_E: [MessageHandler(filters.TEXT & ~filters.COMMAND, saisie_ddnaiss_e)],
+            DUREE_PRET: [MessageHandler(filters.TEXT & ~filters.COMMAND, saisie_duree_pret)],
+            CAP_PRET: [MessageHandler(filters.TEXT & ~filters.COMMAND, saisie_cap_pret)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
         allow_reentry=True,
