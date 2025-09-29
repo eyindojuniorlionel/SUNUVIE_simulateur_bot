@@ -1,9 +1,11 @@
-# bot_completed_with_emprunteur.py
+# bot_completed_with_emprunteur_v2_with_pdf.py
 import os
 import logging
 import pandas as pd
 import datetime
-from telegram import Update
+import io
+from fpdf import FPDF
+from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, InputFile
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -23,7 +25,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # -------------------------
-# États de la conversation
+# ÉTATS DE LA CONVERSATION
 # -------------------------
 (
     PRODUIT,
@@ -45,7 +47,9 @@ logger = logging.getLogger(__name__)
     CAP_PRET,
     # SELECTION MEDICAL
     SEL_MED,
-) = range(16)
+    # État pour demander si l'utilisateur veut le PDF
+    ASK_PDF,
+) = range(17)
 
 # -------------------------
 # Charger les fichiers Excel (avec protections)
@@ -57,7 +61,7 @@ try:
     df_fer_grille = pd.read_excel("table_taux_FER+.xlsx", sheet_name="grille_FER+")
     df_fer_table = pd.read_excel("table_taux_FER+.xlsx", sheet_name="table_taux_FER+")
     # EMPRUNTEUR rates
-    df_emp = pd.read_excel("/mnt/data/tauxEmp.xlsx", sheet_name="tauxEmp")
+    df_emp = pd.read_excel("tauxEmp.xlsx", sheet_name="tauxEmp")
 except Exception as e:
     logger.exception("Erreur en lisant les fichiers Excel. Vérifie qu'ils sont présents et nommés correctement.")
     raise SystemExit(e)
@@ -210,64 +214,161 @@ def get_emp_taux(age: int, duree_mois: int):
         return None
 
 # -------------------------
-# Handlers
+# UI: menu keyboard (command-style buttons pour éviter ambiguité avec saisies numériques)
 # -------------------------
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+MENU_KEYBOARD = ReplyKeyboardMarkup(
+    [
+        ["Assur'Education", "IBEKELIA"],
+        ["FER+", "Emprunteur"],
+        ["Sélection Médicale", "Autres produits"],
+        ["Menu", "Annuler"],
+    ],
+    resize_keyboard=True,
+)
+# -------------------------
+# Helpers conversationnels
+# -------------------------
+async def back_to_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # nettoyer le contexte pour éviter de réutiliser d'anciennes valeurs
+    context.user_data.clear()
     user = update.effective_user
     await update.message.reply_text(
         f"Bonjour {user.first_name or ''} !\n\n"
         "Vous souhaitez faire une cotation de :\n"
-        "1- Assur'Education\n2- IBEKELIA\n3- FER+\n4- Autre produit\n5- Emprunteur\n6- Sélection Médical\n\n"
-        "Répondez par 1, 2, 3, 4, 5 ou 6."
+        "1- Assur'Education\n"
+        "2- IBEKELIA\n"
+        "3- FER+\n"
+        "4- Emprunteur\n"
+        "5- Sélection Médical\n"
+        "6- Autres produits\n\n"
+        "Vous pouvez aussi utiliser les commandes rapides ci-dessous :\n"
+        "/assur  /ibekelia  /fer  /emprunteur  /selection  /autres\n\n"
+        "Répondez par 1, 2, 3, 4, 5 ou 6, ou tapez une commande.",
+        reply_markup=MENU_KEYBOARD,
     )
     return PRODUIT
 
+# Entry-point et helpers de démarrage pour chaque parcours (pour pouvoir lancer un parcours n'importe quand)
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # message d'accueil principal
+    user = update.effective_user
+    await update.message.reply_text(
+        f"Bonjour {user.first_name or ''} !\n\n"
+        "Vous souhaitez faire une cotation de :\n"
+        "1- Assur'Education\n"
+        "2- IBEKELIA\n"
+        "3- FER+\n"
+        "4- Emprunteur\n"
+        "5- Sélection Médical\n"
+        "6- Autres produits\n\n"
+        "Répondez par 1, 2, 3, 4, 5 ou 6.\n"
+        "Vous pouvez aussi utiliser les commandes rapides ci-dessous.\n",
+        reply_markup=MENU_KEYBOARD,
+    )
+    return PRODUIT
+
+async def start_assur(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Parcours Assur'Education :\n\n"
+        "1- Prestation définie ?\n"
+        "2- Cotisation définie ?\n\n"
+        "Répondez 1 ou 2.",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+    return TYPCOT
+
+async def start_ibekelia(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Parcours IBEKELIA :\nEntrez votre année de naissance (AAAA) :", reply_markup=ReplyKeyboardRemove())
+    return DNAISS_I
+
+async def start_fer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Parcours FER+ :\n\n"
+        "Choisissez votre capacité d'épargne (répondez A..H) :\n\n"
+        "Epargne - Décès - Capacité d'épargne total - Capital Déces\n\n"
+        "A - 10 000  - 2 000  - 12 000  - 2 000 000\n"
+        "B - 20 000  - 4 000  - 24 000  - 4 000 000\n"
+        "C - 30 000  - 6 000  - 36 000  - 6 000 000\n"
+        "D - 40 000  - 8 000  - 48 000  - 8 000 000\n"
+        "E - 60 000  - 12 000 - 72 000  - 12 000 000\n"
+        "F - 80 000  - 16 000 - 96 000  - 16 000 000\n"
+        "G - 100 000 - 20 000 - 120 000 - 20 000 000\n"
+        "H - Je peux cotiser plus de 120 000 par mois (saisie libre)",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+    return FER_CHOIX
+
+async def start_emprunteur(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Parcours EMPRUNTEUR :\nEntrez votre année de naissance (AAAA) :", reply_markup=ReplyKeyboardRemove())
+    return DNAISS_E
+
+async def start_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Parcours SÉLECTION MÉDICAL :\nModule en cours de construction…", reply_markup=MENU_KEYBOARD)
+    return PRODUIT
+
+# -------------------------
+# Handlers
+# -------------------------
 async def choix_produit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     choix = update.message.text.strip()
-    if choix == "1":
-        # Parcours Assur'Education (inchangé)
+    norm = choix.strip().lower()
+
+    # commandes directes (/assur, /fer, etc.)
+    if choix.startswith("/"):
+        cmd = choix.lstrip("/").lower()
+        if cmd in ("assur", "assureducation"):
+            return await start_assur(update, context)
+        if cmd == "ibekelia":
+            return await start_ibekelia(update, context)
+        if cmd == "fer":
+            return await start_fer(update, context)
+        if cmd == "emprunteur":
+            return await start_emprunteur(update, context)
+        if cmd == "selection":
+            return await start_selection(update, context)
+        if cmd in ("menu", "start"):
+            return await back_to_menu(update, context)
+        if cmd in ("cancel", "annuler"):
+            return await cancel(update, context)
+
+    # boutons et saisies textuelles (noms complets, numéros, alias)
+    if norm in ("1", "assur'education", "assur", "assureducation"):
+        return await start_assur(update, context)
+    elif norm in ("2", "ibekelia"):
+        return await start_ibekelia(update, context)
+    elif norm in ("3", "fer+", "fer"):
+        return await start_fer(update, context)
+    elif norm in ("4", "emprunteur"):
+        return await start_emprunteur(update, context)
+    elif norm in ("5", "sélection médicale", "selection médicale", "selection", "sélection", "selection medicale"):
         await update.message.reply_text(
-            "Parcours Assur'Education :\n"
-            "1- Prestation définie ?\n"
-            "2- Cotisation définie ?\n\n"
-            "Répondez 1 ou 2."
+            "Parcours SÉLECTION MÉDICALE :\nModule en cours de construction…",
+            reply_markup=MENU_KEYBOARD
         )
-        return TYPCOT
-    elif choix == "2":
-        # Parcours IBEKELIA (inchangé)
-        await update.message.reply_text("Parcours IBEKELIA :\nEntrez votre année de naissance (AAAA) :")
-        return DNAISS_I
-    elif choix == "3":
-        # Parcours FER+
-        await update.message.reply_text(
-            "Parcours FER+ :\n\n"
-            "Choisissez votre capacité d'épargne (répondez A..H) :\n\n"
-            "A - 10 000 (épargne) - 2 000 (décès) - 12 000 (total) - CapDéc 2 000 000\n"
-            "B - 20 000 - 4 000 - 24 000 - 4 000 000\n"
-            "C - 30 000 - 6 000 - 36 000 - 6 000 000\n"
-            "D - 40 000 - 8 000 - 48 000 - 8 000 000\n"
-            "E - 60 000 - 12 000 - 72 000 - 12 000 000\n"
-            "F - 80 000 - 16 000 - 96 000 - 16 000 000\n"
-            "G - 100 000 - 20 000 - 120 000 - 20 000 000\n"
-            "H - Je peux cotiser plus de 120 000 par mois (saisie libre)"
-        )
-        return FER_CHOIX
-    elif choix == "5":
-        await update.message.reply_text("Parcours EMPRUNTEUR :\nEntrez votre année de naissance (AAAA) :")
-        return DNAISS_E
-    elif choix == "6":
-        await update.message.reply_text("Parcours SÉLECTION MÉDICAL :\nModule en cours de développement…")
-        return ConversationHandler.END
+        return PRODUIT
+    elif norm in ("6", "autres produits", "autres"):
+        await update.message.reply_text("Parcours en construction…", reply_markup=MENU_KEYBOARD)
+        return PRODUIT
+    elif norm in ("menu", "start"):
+        return await back_to_menu(update, context)
+    elif norm in ("annuler", "cancel"):
+        return await cancel(update, context)
     else:
-        # Autre produit / construction (conserve le comportement précédent)
-        await update.message.reply_text("Parcours en construction…")
-        return ConversationHandler.END
+        await update.message.reply_text(
+            "Choix non reconnu. Utilisez les boutons du menu ou tapez /menu pour revenir au menu principal.",
+            reply_markup=MENU_KEYBOARD,
+        )
+        return PRODUIT
 
 # -------------------------
 # Assur'Education handlers (identiques)
 # -------------------------
 async def choix_typcot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     txt = update.message.text.strip()
+    # permettre de revenir au menu à tout moment via la commande /menu
+    if txt == "/menu":
+        return await back_to_menu(update, context)
+
     if txt not in ("1", "2"):
         await update.message.reply_text("Choix invalide. Répondez 1 (Prestation) ou 2 (Cotisation).")
         return TYPCOT
@@ -277,6 +378,8 @@ async def choix_typcot(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def saisie_ddnaiss(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
+    if text == "/menu":
+        return await back_to_menu(update, context)
     try:
         ddNaiss = int(text)
         if ddNaiss < 1900 or ddNaiss > datetime.datetime.now().year:
@@ -302,6 +405,8 @@ async def saisie_ddnaiss(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def saisie_duree(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
+    if text == "/menu":
+        return await back_to_menu(update, context)
     try:
         duree = int(text)
     except Exception:
@@ -321,6 +426,8 @@ async def saisie_duree(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def saisie_nb_rente(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
+    if text == "/menu":
+        return await back_to_menu(update, context)
     try:
         nb_rente = int(text)
     except Exception:
@@ -361,6 +468,8 @@ async def saisie_nb_rente(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def saisie_montant(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
+    if text == "/menu":
+        return await back_to_menu(update, context)
     try:
         montant = float(text.replace(",", "."))
     except Exception:
@@ -376,7 +485,7 @@ async def saisie_montant(update: Update, context: ContextTypes.DEFAULT_TYPE):
     taux = get_taux(age, nb_rente, duree)
     if taux is None or taux == 0:
         await update.message.reply_text("Désolé, aucun taux trouvé pour vos paramètres (ou taux nul). Recommencez avec /start.")
-        return ConversationHandler.END
+        return await back_to_menu(update, context)
 
     if typCot == 1:
         mtRente = montant
@@ -385,6 +494,25 @@ async def saisie_montant(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"✅ Votre bénéficiaire pourra jouir d'une rente annuelle de : {mtRente:,.2f}\n"
             f"pendant {nb_rente} années contre une cotisation mensuelle de {cotisation_mensuelle:,.2f}."
         )
+
+        # Préparer le récapitulatif pour le PDF
+        context.user_data["last_recap"] = {
+            "product": "Assur'Education",
+            "title": "Assur'Education - Récapitulatif",
+            "inputs": {
+                "Type de cotisation": "Prestation",
+                "Année de naissance": data.get("ddNaiss"),
+                "Âge": age,
+                "Durée cotisation (ans)": duree,
+                "Nombre de rentes": nb_rente,
+                "Montant rente annuelle": mtRente,
+            },
+            "results": {
+                "Taux": taux,
+                "Cotisation mensuelle": f"{cotisation_mensuelle:,.2f}",
+            },
+        }
+
     else:
         mtCot = montant
         rente_annuelle = mtCot / taux
@@ -394,11 +522,31 @@ async def saisie_montant(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"pendant {nb_rente} années."
         )
 
-    return ConversationHandler.END
+        context.user_data["last_recap"] = {
+            "product": "Assur'Education",
+            "title": "Assur'Education - Récapitulatif",
+            "inputs": {
+                "Type de cotisation": "Cotisation",
+                "Année de naissance": data.get("ddNaiss"),
+                "Âge": age,
+                "Durée cotisation (ans)": duree,
+                "Nombre de rentes": nb_rente,
+                "Cotisation mensuelle saisie": mtCot,
+            },
+            "results": {
+                "Taux": taux,
+                "Rente annuelle": f"{rente_annuelle:,.2f}",
+            },
+        }
+
+    # Demander à l'utilisateur s'il souhaite le PDF
+    return await ask_pdf_and_store(update, context)
 
 # ----- IBEKELIA (identique) -----
 async def saisie_ddnaiss_i(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
+    if text == "/menu":
+        return await back_to_menu(update, context)
     try:
         ddNaiss = int(text)
         if ddNaiss < 1900 or ddNaiss > datetime.datetime.now().year:
@@ -422,24 +570,32 @@ async def saisie_ddnaiss_i(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Entrez la périodicité de cotisation !\n"
         "M - pour mensuelle\n"
         "A - pour annuelle\n"
-        "U - pour unique"
+        "U - pour unique",
     )
     return PERIODE_I
 
 async def saisie_periode(update: Update, context: ContextTypes.DEFAULT_TYPE):
     per = update.message.text.strip().upper()
+    if per == "/menu":
+        return await back_to_menu(update, context)
     if per not in ("M", "A", "U"):
         await update.message.reply_text("Périodicité invalide. Répondez M, A ou U.")
         return PERIODE_I
     context.user_data["perCot"] = per
     await update.message.reply_text(
         "Entrez le capital d'assistance obsèques souhaité !\n"
-        "1- 1 000 000\n2- 2 000 000\n3- 3 000 000\n4- 4 000 000\n5- 5 000 000"
+        "1- 1 000 000\n"
+        "2- 2 000 000\n"
+        "3- 3 000 000\n"
+        "4- 4 000 000\n"
+        "5- 5 000 000"
     )
     return CAPOBSQ_I
 
 async def saisie_capobsq(update: Update, context: ContextTypes.DEFAULT_TYPE):
     choix = update.message.text.strip()
+    if choix == "/menu":
+        return await back_to_menu(update, context)
     if choix not in CAP_OBSEQUES:
         await update.message.reply_text("Choix invalide. Répondez 1,2,3,4 ou 5.")
         return CAPOBSQ_I
@@ -451,18 +607,36 @@ async def saisie_capobsq(update: Update, context: ContextTypes.DEFAULT_TYPE):
     prime = get_prime(age, per_cot, cap_obsq)
     if prime is None:
         await update.message.reply_text("Désolé, aucun tarif trouvé pour vos paramètres. Vérifiez la périodicité et l'âge.")
-        return ConversationHandler.END
+        return await back_to_menu(update, context)
 
     await update.message.reply_text(
         f"✅ Pour une cotisation {per_cot} de {prime:,.2f},\n"
         f"vous garantissez à vos proches un capital de {cap_obsq:,.0f}.\n"
         "Vous les libérez ainsi des soucis financiers et organisationnels liés à vos obsèques, en toute sérénité."
     )
-    return ConversationHandler.END
+
+    # Préparer le récapitulatif
+    context.user_data["last_recap"] = {
+        "product": "IBEKELIA",
+        "title": "IBEKELIA - Récapitulatif",
+        "inputs": {
+            "Année de naissance": data.get("ddNaiss"),
+            "Âge": age,
+            "Périodicité": per_cot,
+            "Capital obsèques": cap_obsq,
+        },
+        "results": {
+            "Prime": f"{prime:,.2f}",
+        },
+    }
+
+    return await ask_pdf_and_store(update, context)
 
 # ----- FER+ handlers (nouveau parcours 3) -----
 async def fer_choix(update: Update, context: ContextTypes.DEFAULT_TYPE):
     choix = update.message.text.strip().upper()
+    if choix == "/menu":
+        return await back_to_menu(update, context)
     # Accept A..G from grille plus H (saisie libre)
     valid_choices = list(df_fer_grille.index) + ["H"]
     if choix not in valid_choices:
@@ -475,6 +649,8 @@ async def fer_choix(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def fer_duree(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
+    if text == "/menu":
+        return await back_to_menu(update, context)
     try:
         duree = int(text)
     except Exception:
@@ -501,12 +677,12 @@ async def fer_duree(update: Update, context: ContextTypes.DEFAULT_TYPE):
         grille = get_fer_grille(choix)
         if grille is None:
             await update.message.reply_text("Erreur interne : grille introuvable pour ce choix.")
-            return ConversationHandler.END
+            return await back_to_menu(update, context)
 
-        cotMensEp = float(grille["cotMensEp"])
-        cotMensPrev = float(grille["cotMensPrev"])
-        cotMensTot = float(grille["cotMensTot"])
-        capDec = float(grille["capDec"])
+        cotMensEp = float(grille["cotMensEp"]) if pd.notna(grille["cotMensEp"]) else 0
+        cotMensPrev = float(grille["cotMensPrev"]) if pd.notna(grille["cotMensPrev"]) else 0
+        cotMensTot = float(grille["cotMensTot"]) if pd.notna(grille["cotMensTot"]) else 0
+        capDec = float(grille["capDec"]) if pd.notna(grille["capDec"]) else 0
         tauxP = context.user_data["fer_tauxP"]
         # calcul
         capAcquis = tauxP * cotMensEp
@@ -517,10 +693,31 @@ async def fer_duree(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"- un capital acquis de {capAcquis:,.2f} en cas de vie au terme du contrat ;\n"
             f"- un capital décès de {capDec:,.0f} + la valeur de l'épargne constituée en cas de décès avant terme."
         )
-        return ConversationHandler.END
+
+        # Préparer récapitulatif
+        context.user_data["last_recap"] = {
+            "product": "FER+",
+            "title": "FER+ - Récapitulatif",
+            "inputs": {
+                "Choix grille": choix,
+                "Durée (ans)": duree,
+                "Cot mens ep (épargne)": cotMensEp,
+                "Cot mens prev (décès)": cotMensPrev,
+                "Cot mens tot": cotMensTot,
+            },
+            "results": {
+                "TauxP": tauxP,
+                "Capital acquis": f"{capAcquis:,.2f}",
+                "Capital décès garanti": f"{capDec:,.0f}",
+            },
+        }
+
+        return await ask_pdf_and_store(update, context)
 
 async def fer_montant(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip().replace(",", ".")
+    if text == "/menu":
+        return await back_to_menu(update, context)
     try:
         mtCot = float(text)
     except Exception:
@@ -541,11 +738,30 @@ async def fer_montant(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"- un capital acquis de {capAcquis:,.2f} en cas de vie au terme du contrat ;\n"
         f"- un capital décès de 20 000 000 + la valeur de l'épargne constituée en cas de décès avant terme."
     )
-    return ConversationHandler.END
+
+    # Préparer récapitulatif
+    context.user_data["last_recap"] = {
+        "product": "FER+",
+        "title": "FER+ - Récapitulatif",
+        "inputs": {
+            "Choix grille": "H (saisie libre)",
+            "Durée (ans)": duree,
+            "Cotisation mensuelle saisie": mtCot,
+        },
+        "results": {
+            "TauxP": tauxP,
+            "Capital acquis": f"{capAcquis:,.2f}",
+            "Capital décès garanti": "20 000 000 + épargne",
+        },
+    }
+
+    return await ask_pdf_and_store(update, context)
 
 # ----- EMPRUNTEUR handlers (nouveau) -----
 async def saisie_ddnaiss_e(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
+    if text == "/menu":
+        return await back_to_menu(update, context)
     try:
         ddNaiss = int(text)
         if ddNaiss < 1900 or ddNaiss > datetime.datetime.now().year:
@@ -561,7 +777,7 @@ async def saisie_ddnaiss_e(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Âge hors grille pour Emprunteur (âge calculé = {age}).\n"
             "Veuillez contacter un conseiller ou recommencer avec /start."
         )
-        return ConversationHandler.END
+        return await back_to_menu(update, context)
 
     context.user_data["ddNaiss"] = ddNaiss
     context.user_data["age"] = age
@@ -570,6 +786,8 @@ async def saisie_ddnaiss_e(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def saisie_duree_pret(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
+    if text == "/menu":
+        return await back_to_menu(update, context)
     try:
         duree = int(text)
     except Exception:
@@ -582,7 +800,7 @@ async def saisie_duree_pret(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"Aucun taux trouvé pour une durée de {duree} mois. Vérifiez la durée ou contactez un conseiller."
         )
-        return ConversationHandler.END
+        return await back_to_menu(update, context)
 
     context.user_data["dureePret"] = duree
     await update.message.reply_text("Entrez le capital emprunté (ex: 5000000) :")
@@ -590,6 +808,8 @@ async def saisie_duree_pret(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def saisie_cap_pret(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip().replace(",", "")
+    if text == "/menu":
+        return await back_to_menu(update, context)
     try:
         capPret = float(text)
     except Exception:
@@ -602,20 +822,127 @@ async def saisie_cap_pret(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tauxPrime = get_emp_taux(age, duree)
     if tauxPrime is None:
         await update.message.reply_text("Désolé, aucun taux trouvé pour vos paramètres. Rendez-vous chez SUNU pour la prise en charge de votre requête.")
-        return ConversationHandler.END
+        return await back_to_menu(update, context)
 
     prime = tauxPrime * capPret
     if prime == 0:
-        await update.message.reply_text("Rendez-vous chez SUNU pour la prise en charge de votre requête.")
+        await update.message.reply_text("Rendez-vous chez SUNU pour la prise en charge de votre requête.", reply_markup=MENU_KEYBOARD)
     else:
         await update.message.reply_text(f"✅ La prime unique est de : {prime:,.2f} Fcfa.")
 
-    return ConversationHandler.END
+    # Préparer récapitulatif
+    context.user_data["last_recap"] = {
+        "product": "Emprunteur",
+        "title": "Emprunteur - Récapitulatif",
+        "inputs": {
+            "Année de naissance": context.user_data.get("ddNaiss"),
+            "Âge": age,
+            "Durée (mois)": duree,
+            "Capital emprunté": capPret,
+        },
+        "results": {
+            "TauxPrime": tauxPrime,
+            "Prime unique": f"{prime:,.2f}",
+        },
+    }
+
+    return await ask_pdf_and_store(update, context)
 
 # ----- Cancel -----
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Opération annulée. Tapez /start pour recommencer.")
-    return ConversationHandler.END
+    await update.message.reply_text("Opération annulée.", reply_markup=MENU_KEYBOARD)
+    return PRODUIT
+
+# -------------------------
+# PDF utilities
+# -------------------------
+
+def generate_pdf_bytes(recap: dict) -> bytes:
+    """Génère un PDF en mémoire (bytes) à partir du récapitulatif fourni.
+    recap doit contenir : product (str), title (str), inputs (dict), results (dict)
+    """
+    pdf = FPDF()
+    pdf.set_auto_page_break(auto=True, margin=15)
+    pdf.add_page()
+
+    # Logo (en haut à gauche) si présent
+    if os.path.exists("Logo_sunu.jpg"):
+        try:
+            pdf.image("Logo_sunu.jpg", x=10, y=8, w=30)
+        except Exception:
+            logger.warning("Impossible d'insérer Logo_sunu.jpg dans le PDF (format/police).")
+
+    # Titre
+    pdf.set_font("Arial", "B", 14)
+    pdf.cell(0, 10, f"Simulation - {recap.get('product', '')}", ln=1, align="C")
+    pdf.ln(6)
+
+    # Informations saisies
+    pdf.set_font("Arial", "B", 12)
+    pdf.cell(0, 8, "Informations saisies :", ln=1)
+    pdf.set_font("Arial", size=11)
+    inputs = recap.get("inputs", {})
+    for k, v in inputs.items():
+        pdf.multi_cell(0, 7, f"- {k}: {v}")
+
+    pdf.ln(3)
+
+    # Résultats (personnalisation légère selon produit)
+    pdf.set_font("Arial", "B", 12)
+    pdf.cell(0, 8, "Résultats :", ln=1)
+    pdf.set_font("Arial", size=11)
+    results = recap.get("results", {})
+    for k, v in results.items():
+        pdf.multi_cell(0, 7, f"- {k}: {v}")
+
+    pdf.ln(6)
+    pdf.set_font("Arial", "I", 9)
+    pdf.cell(0, 5, "Généré le: " + datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), ln=1, align="R")
+
+    out = pdf.output(dest='S')
+    if isinstance(out, str):
+        return out.encode('latin-1')
+    return out
+
+
+async def ask_pdf_and_store(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Pose la question Oui/Non pour envoyer le PDF."""
+    keyboard = ReplyKeyboardMarkup([["Oui", "Non"]], one_time_keyboard=True, resize_keyboard=True)
+    await update.message.reply_text(
+        "Souhaitez-vous recevoir un PDF récapitulatif de cette simulation ? (Oui / Non)",
+        reply_markup=keyboard,
+    )
+    return ASK_PDF
+
+
+async def handle_pdf_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    txt = update.message.text.strip().lower()
+
+    if txt in ("oui", "o", "yes", "y"):
+        recap = context.user_data.get("last_recap")
+        if not recap:
+            await update.message.reply_text("Aucune donnée disponible pour générer un PDF.", reply_markup=MENU_KEYBOARD)
+            return await back_to_menu(update, context)
+
+        pdf_bytes = generate_pdf_bytes(recap)
+        bio = io.BytesIO(pdf_bytes)
+        bio.name = f"simulation_{recap.get('product','simulation')}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
+        bio.seek(0)
+
+        try:
+            # Envoi du document (Telegram gère le téléchargement)
+            await update.message.reply_document(document=InputFile(bio, filename=bio.name))
+        except Exception as e:
+            logger.exception("Erreur en envoyant le PDF : %s", e)
+            await update.message.reply_text("Erreur lors de l'envoi du PDF.")
+
+        # Cleanup : on supprime le récapitulatif si vous souhaitez ne pas le garder
+        context.user_data.pop("last_recap", None)
+
+        return await back_to_menu(update, context)
+
+    # si non -> retour au menu sans envoi
+    return await back_to_menu(update, context)
 
 # -------------------------
 # Lancer le bot
@@ -627,8 +954,18 @@ def main():
 
     application = Application.builder().token(token).build()
 
+    # ConversationHandler with multiple entry points (commands) so we can start any parcours at any time
     conv_handler = ConversationHandler(
-        entry_points=[CommandHandler("start", start)],
+        entry_points=[
+            CommandHandler("start", start),
+            CommandHandler("menu", start),
+            CommandHandler("assur", start_assur),
+            CommandHandler("assureducation", start_assur),
+            CommandHandler("ibekelia", start_ibekelia),
+            CommandHandler("fer", start_fer),
+            CommandHandler("emprunteur", start_emprunteur),
+            CommandHandler("selection", start_selection),
+        ],
         states={
             PRODUIT: [MessageHandler(filters.TEXT & ~filters.COMMAND, choix_produit)],
             # Assur'Education states (inchangés)
@@ -649,14 +986,18 @@ def main():
             DNAISS_E: [MessageHandler(filters.TEXT & ~filters.COMMAND, saisie_ddnaiss_e)],
             DUREE_PRET: [MessageHandler(filters.TEXT & ~filters.COMMAND, saisie_duree_pret)],
             CAP_PRET: [MessageHandler(filters.TEXT & ~filters.COMMAND, saisie_cap_pret)],
+            # ASK PDF
+            ASK_PDF: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_pdf_choice)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
         allow_reentry=True,
     )
 
     application.add_handler(conv_handler)
+
     logger.info("Bot démarré. En attente de messages...")
     application.run_polling()
+
 
 if __name__ == "__main__":
     main()
